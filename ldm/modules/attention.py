@@ -7,6 +7,12 @@ from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
 
+try:
+    import xformers.ops
+    MEM_EFFICIENT_ATTN = True
+except ImportError:
+    MEM_EFFICIENT_ATTN = False
+
 
 def exists(val):
     return val is not None
@@ -178,26 +184,32 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
+        if MEM_EFFICIENT_ATTN:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            r1 = xformers.ops.memory_efficient_attention(q, k, v)
 
-        # valid values for steps = 2,4,8,16,32,64
-        # higher steps is slower but less memory usage
-        # at 16 can run 1920x1536 on a 3090, at 64 can run over 1920x1920
-        # speed seems to be impacted more on 30x series cards
-        steps = 16
-        slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
-        for i in range(0, q.shape[1], slice_size):
-            end = i + slice_size
-            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
-            s1 *= self.scale
-            s2 = s1.softmax(dim=-1)
-            del s1
-            r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
-            del s2
-        r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
-        del r1
+        else:
+            r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
 
-        return self.to_out(r2)
+            # valid values for steps = 2,4,8,16,32,64
+            # higher steps is slower but less memory usage
+            # at 16 can run 1920x1536 on a 3090, at 64 can run over 1920x1920
+            # speed seems to be impacted more on 30x series cards
+            steps = 16
+            slice_size = q.shape[1] // steps if q.shape[1] % steps == 0 else q.shape[1]
+            for i in range(0, q.shape[1], slice_size):
+                end = i + slice_size
+                s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
+                s1 *= self.scale
+                s2 = s1.softmax(dim=-1)
+                del s1
+                r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+                del s2
+        r1 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+
+        return self.to_out(r1)
 
 
 class BasicTransformerBlock(nn.Module):
